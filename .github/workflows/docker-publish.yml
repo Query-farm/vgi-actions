@@ -1,0 +1,259 @@
+# Copyright 2026 Query Farm LLC - https://query.farm
+#
+# Reusable workflow: build, test, and publish a multi-arch (linux/amd64 +
+# linux/arm64) container image for a VGI worker to ghcr.io.
+#
+# Each architecture is built on a NATIVE runner and exercised BEFORE it is
+# pushed: an import smoke + a dual-transport (/health on HTTP) boot on both
+# arches, plus an optional caller-provided full-suite hook (`image_test`) on
+# amd64. The per-arch images are then pushed by digest, assembled into one
+# multi-arch manifest under the release/edge tags, and cosign-signed (keyless).
+#
+# This workflow is `workflow_call`-only. The CALLER triggers on push/tag and is
+# responsible for gating on its own test suite — run the repo's ci.yml as a
+# `needs:` job before the job that calls this. Tag/branch context (semver tags,
+# :edge on the default branch, :sha) is read from the caller's github context.
+#
+# Caller skeleton:
+#   jobs:
+#     ci:
+#       uses: ./.github/workflows/ci.yml
+#     publish:
+#       needs: [ci]
+#       permissions: { contents: read, packages: write, id-token: write, attestations: write }
+#       uses: Query-farm/vgi-actions/.github/workflows/docker-publish.yml@v1
+#       secrets: inherit
+#       with:
+#         image_name: vgi-sklearn
+#         smoke_import: "vgi_sklearn, sklearn, numpy, scipy"
+name: docker-publish (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: Image name under ghcr.io/<owner>/ (e.g. vgi-sklearn).
+        required: true
+        type: string
+      context:
+        description: Docker build context.
+        type: string
+        default: .
+      dockerfile:
+        description: Path to the Dockerfile.
+        type: string
+        default: Dockerfile
+      smoke_import:
+        description: >-
+          Comma-separated modules to `import` in an in-container smoke (both
+          arches), e.g. "vgi_sklearn, sklearn, numpy, scipy". Empty = skip.
+        type: string
+        default: ""
+      health_port:
+        description: Port the HTTP transport serves /health on.
+        type: string
+        default: "8000"
+      http_run_args:
+        description: >-
+          Extra `docker run` args for the HTTP boot smoke (e.g.
+          "-e VGI_SIGNING_KEY=dev"). Empty = none.
+        type: string
+        default: ""
+      version_check_cmd:
+        description: >-
+          Command run on a version-tag push with the tag appended as $1 (e.g.
+          "ci/check-version.sh"), to assert the tag matches the package version.
+          Empty = skip.
+        type: string
+        default: ""
+      image_test:
+        description: >-
+          Optional shell run on amd64 after the image builds, for the full
+          suite against the container. `$CITEST_IMAGE` is the loaded image ref
+          (<image>:citest-amd64). Runs in the caller's checkout. Empty = rely on
+          the import + /health smoke only.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-publish-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ${{ inputs.image_name }}
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write          # push to ghcr
+      id-token: write          # keyless signing / provenance
+      attestations: write      # provenance + SBOM attestations
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04,     platform: linux/amd64, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, platform: linux/arm64, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve image ref (owner lowercased)
+        run: echo "IMAGE=ghcr.io/$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')/$IMAGE_NAME" >> "$GITHUB_ENV"
+
+      # Fail fast on a version tag that doesn't match the package version.
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/') && inputs.version_check_cmd != ''
+        run: ${{ inputs.version_check_cmd }} "${{ github.ref_name }}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+
+      # 1) Build the single-arch image and load it locally so we can test it.
+      - name: Build (load for testing)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: ${{ env.IMAGE }}:citest-${{ matrix.arch }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+
+      # 2) Generic image smoke (both arches): the heavy deps import, and the
+      #    HTTP transport boots and answers /health.
+      - name: Smoke — imports
+        if: inputs.smoke_import != ''
+        run: |
+          docker run --rm --entrypoint python "${IMAGE}:citest-${{ matrix.arch }}" \
+            -c "import ${{ inputs.smoke_import }}; print('import OK')"
+
+      - name: Smoke — HTTP /health
+        run: |
+          CID=$(docker run -d -p ${{ inputs.health_port }}:${{ inputs.health_port }} \
+                  ${{ inputs.http_run_args }} "${IMAGE}:citest-${{ matrix.arch }}")
+          trap 'docker rm -f "$CID" >/dev/null 2>&1' EXIT
+          ok=
+          for _ in $(seq 1 30); do
+            curl -fsS -o /dev/null "http://localhost:${{ inputs.health_port }}/health" && { ok=1; break; }
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { echo "::error::${{ matrix.arch }} image failed /health"; docker logs "$CID"; exit 1; }
+
+      # 3) Optional caller-provided full suite against the image (amd64).
+      - name: Image test (caller-provided)
+        if: matrix.arch == 'amd64' && inputs.image_test != ''
+        env:
+          CITEST_IMAGE: ${{ env.IMAGE }}:citest-amd64
+          GH_TOKEN: ${{ github.token }}
+        run: ${{ inputs.image_test }}
+
+      # 4) Tests passed -> push BY DIGEST (no tags yet) with provenance + SBOM.
+      - name: Push by digest
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          provenance: true
+          sbom: true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Resolve image ref (owner lowercased)
+        run: echo "IMAGE=ghcr.io/$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')/$IMAGE_NAME" >> "$GITHUB_ENV"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=sha
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          # Deliberate word-splitting: expand the -t tag flags and the per-arch
+          # image@digest references into separate argv entries.
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign the multi-arch image (keyless)
+        run: |
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}" \
+            --format '{{ json .Manifest.Digest }}' | tr -d '"')
+          cosign sign --yes "${IMAGE}@${DIGEST}"
