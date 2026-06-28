@@ -182,4 +182,4 @@ the **uber/shaded** jar (not the thin jar).
 
 Inputs: `jar` (required), `build_cmd` (default `mvn -B -ntp -DskipTests
 package`), `asset_prefix` (default repo name), `version_check_cmd`,
-`java_version` (default `21`), `java_distribution` (default `temurin`).
+`java_version` (default `21`), `java_distribution` (default `temurin`), `cache` (default none; set `gradle` for Gradle projects).

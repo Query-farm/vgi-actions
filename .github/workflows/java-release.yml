@@ -48,6 +48,12 @@ on:
         description: JDK distribution for actions/setup-java.
         type: string
         default: "temurin"
+      cache:
+        description: >-
+          Build-tool cache for actions/setup-java (maven | gradle | sbt). Empty
+          = no caching. Set `gradle` for Gradle projects.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -91,7 +97,7 @@ jobs:
         with:
           java-version: ${{ inputs.java_version }}
           distribution: ${{ inputs.java_distribution }}
-          cache: maven
+          cache: ${{ inputs.cache }}
 
       - name: Build the jar
         run: ${{ inputs.build_cmd }}
