@@ -82,3 +82,85 @@ Notes:
   workflow path resolves inside *this* repo), so gating lives in the caller.
 - Multi-arch is fixed to amd64 + arm64 on native runners; that is the supported
   baseline.
+
+## `binary-release.yml` — cross-platform binary build & GitHub Release
+
+A reusable workflow for **binary-driven (Rust) workers**: it builds the worker
+binary for every supported platform and attaches the archives to the GitHub
+Release for a `vX.Y.Z` tag, each with a **SHA256**, a keyless **cosign
+signature** (`.cosign.bundle`), and a **SLSA build-provenance** attestation.
+
+Standardized so every worker ships the same shape:
+
+- one **`.tar.gz` per DuckDB platform** (`linux_amd64`, `linux_arm64`,
+  `osx_amd64`, `osx_arm64`, `windows_amd64`) — Windows ships `.tar.gz` too (not
+  `.zip`), since the vgi client only reads `.tar.gz`. Assets are named
+  `<asset_prefix>-<tag>-<duckdb_platform>.tar.gz`.
+- macOS builds on **Apple Silicon** (`macos-15`); the Intel (`osx_amd64`) binary
+  is **cross-compiled** (the last Intel runner image, `macos-13`, is
+  scarce/deprecated). Every other target builds native.
+
+### Usage
+
+`workflow_call`-only; the **caller gates on its own test suite**, then calls it:
+
+```yaml
+name: Release binaries
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml          # gate: the repo's own suite
+  release:
+    needs: [ci]
+    permissions:
+      contents: write       # create Release + upload assets
+      id-token: write       # keyless cosign + provenance (sigstore OIDC)
+      attestations: write   # SLSA build-provenance
+    uses: Query-farm/vgi-actions/.github/workflows/binary-release.yml@v1
+    secrets: inherit
+    with:
+      bin: units-worker            # cargo bin to build (executable in the archive)
+      asset_prefix: vgi-units      # optional; defaults to the repo name
+      version_check_cmd: ci/check-version.sh
+```
+
+### Inputs
+
+| Input | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `bin` | yes | — | Cargo bin name to build and package (the executable inside each archive). |
+| `asset_prefix` | no | repo name | Archive base-name prefix → `<asset_prefix>-<tag>-<platform>.tar.gz`. |
+| `version_check_cmd` | no | `""` | Command run on a version-tag push with the tag as `$1` (e.g. `ci/check-version.sh`). Empty = skip. |
+| `include` | no | `README.md,LICENSE` | Comma-separated extra files to include in each archive. |
+
+### Verifying a release binary
+
+Signing runs in **this** workflow, so the keyless identity is
+`Query-farm/vgi-actions/.github/workflows/binary-release.yml` (same model as the
+signed images), not the caller's `release.yml`:
+
+```sh
+cosign verify-blob \
+  --bundle vgi-units-v0.1.3-linux_amd64.tar.gz.cosign.bundle \
+  --certificate-identity-regexp '^https://github\.com/Query-farm/vgi-actions/\.github/workflows/binary-release\.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  vgi-units-v0.1.3-linux_amd64.tar.gz
+
+# Provenance (verify against the caller repo; the signer is vgi-actions):
+gh attestation verify vgi-units-v0.1.3-linux_amd64.tar.gz \
+  --repo Query-farm/vgi-units \
+  --signer-repo Query-farm/vgi-actions
+```
+
+### Contract
+
+The workflow expects a Cargo workspace whose `bin` target builds with
+`cargo build --release --locked`. A `version_check_cmd` (if given) is a
+repo-local script taking the tag as `$1` and exiting non-zero on mismatch.
