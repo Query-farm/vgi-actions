@@ -95,6 +95,12 @@ jobs:
       # Default the asset prefix to the repo name (input defaults can't use
       # contexts, so the fallback lives here).
       ASSET_PREFIX: ${{ inputs.asset_prefix || github.event.repository.name }}
+      # Harden cargo's crate downloads against transient CDN connection resets
+      # (curl 56 / OpenSSL "unexpected eof" mid-download): retry more, and drop
+      # HTTP/2 multiplexing — the known workaround for registry connection-reset
+      # flakes. Applies to the build step below.
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
     strategy:
       fail-fast: false
       matrix:
