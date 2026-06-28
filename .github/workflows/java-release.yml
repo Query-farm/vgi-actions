@@ -1,0 +1,134 @@
+# Copyright 2026 Query Farm LLC - https://query.farm
+#
+# Reusable workflow: build a Java VGI worker and attach the runnable JAR (+
+# SHA256 + keyless cosign signature + SLSA provenance) to the GitHub Release for
+# a vX.Y.Z tag. The Java analogue of rust-release.yml.
+#
+# A JVM jar is platform-independent, so — unlike the Rust/Go binary workflows —
+# there is NO per-platform matrix: one artifact, <asset_prefix>-<tag>.jar, run
+# with `java -jar`. It is cosign sign-blob'd into a .cosign.bundle and SLSA
+# build-provenance attested. The caller's `jar` input must point at the runnable
+# fat/uber jar the build produces (e.g. the shade/assembly output), not the thin
+# jar.
+#
+# Signing runs HERE, so the keyless identity is this workflow
+# (Query-farm/vgi-actions/.github/workflows/java-release.yml). workflow_call-only;
+# the CALLER gates on its own test suite. See README.md.
+name: java-release (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      jar:
+        description: >-
+          Glob for the runnable (fat/uber) jar the build produces, e.g.
+          `target/*-jar-with-dependencies.jar` or `build/libs/*-all.jar`. The
+          single match is published as <asset_prefix>-<tag>.jar.
+        required: true
+        type: string
+      build_cmd:
+        description: Command that builds the jar.
+        type: string
+        default: "mvn -B -ntp -DskipTests package"
+      asset_prefix:
+        description: Asset base-name. Defaults to the repository name.
+        type: string
+        default: ""
+      version_check_cmd:
+        description: >-
+          Command run on a version-tag push with the tag appended as $1, to
+          assert the tag matches the worker version. Empty = skip.
+        type: string
+        default: ""
+      java_version:
+        description: Java version for actions/setup-java.
+        type: string
+        default: "21"
+      java_distribution:
+        description: JDK distribution for actions/setup-java.
+        type: string
+        default: "temurin"
+
+permissions:
+  contents: read
+
+jobs:
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches worker version
+        if: inputs.version_check_cmd != ''
+        run: ${{ inputs.version_check_cmd }} "${GITHUB_REF_NAME}"
+      - name: Create the GitHub Release if it doesn't exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists."
+          else
+            gh release create "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+              --title "${GITHUB_REF_NAME}" --generate-notes
+          fi
+
+  upload:
+    needs: [create-release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      ASSET_PREFIX: ${{ inputs.asset_prefix || github.event.repository.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: ${{ inputs.java_distribution }}
+          cache: maven
+
+      - name: Build the jar
+        run: ${{ inputs.build_cmd }}
+
+      - name: Resolve, checksum the jar
+        id: jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Exactly one runnable jar is expected from the glob.
+          shopt -s nullglob
+          matches=( ${{ inputs.jar }} )
+          if [ "${#matches[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one jar from glob '${{ inputs.jar }}', found ${#matches[@]}: ${matches[*]:-<none>}" >&2
+            exit 1
+          fi
+          ASSET="${ASSET_PREFIX}-${TAG}.jar"
+          cp "${matches[0]}" "$ASSET"
+          sha256sum "$ASSET" > "${ASSET_PREFIX}-${TAG}.sha256"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign + upload jar, checksum, bundle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          ASSET="${{ steps.jar.outputs.asset }}"
+          cosign sign-blob --yes --bundle "${ASSET}.cosign.bundle" "$ASSET"
+          gh release upload "$TAG" "$ASSET" "${ASSET_PREFIX}-${TAG}.sha256" "${ASSET}.cosign.bundle" --clobber
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.jar.outputs.asset }}

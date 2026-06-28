@@ -1,0 +1,162 @@
+# Copyright 2026 Query Farm LLC - https://query.farm
+#
+# Reusable workflow: build a Go VGI worker for every supported platform and
+# attach the archives (+ SHA256 + keyless cosign signature + SLSA provenance) to
+# the GitHub Release for a vX.Y.Z tag. The Go analogue of rust-release.yml.
+#
+# Go cross-compiles, so every DuckDB platform (linux_amd64, linux_arm64,
+# osx_amd64, osx_arm64, windows_amd64) is built on a SINGLE linux runner via
+# GOOS/GOARCH — no native macOS/Windows runners needed. Assets are named
+# <asset_prefix>-<tag>-<duckdb_platform>.tar.gz (.tar.gz on every platform,
+# Windows included, since the vgi client only reads .tar.gz; the Windows binary
+# is <bin>.exe inside). Each archive is cosign sign-blob'd into a .cosign.bundle
+# and SLSA build-provenance attested. Builds default to CGO_ENABLED=0 (pure-Go
+# static cross-compile); set `cgo: true` only for a worker that needs it (then
+# cross-compilation typically won't work and you'd need a different matrix).
+#
+# Signing runs HERE, so the keyless identity is this workflow
+# (Query-farm/vgi-actions/.github/workflows/go-release.yml). workflow_call
+# -only; the CALLER gates on its own test suite. See README.md.
+name: go-release (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      bin:
+        description: Output binary name (the executable inside each archive). Defaults to the repo name.
+        type: string
+        default: ""
+      package:
+        description: Go package to build (the `go build` target).
+        type: string
+        default: "."
+      asset_prefix:
+        description: Archive base-name prefix. Defaults to the repository name.
+        type: string
+        default: ""
+      version_check_cmd:
+        description: >-
+          Command run on a version-tag push with the tag appended as $1, to
+          assert the tag matches the worker version. Empty = skip.
+        type: string
+        default: ""
+      ldflags:
+        description: >-
+          Extra `-ldflags` for the build (e.g. "-s -w -X main.version=${TAG}").
+          The string ${TAG} is replaced with the release tag.
+        type: string
+        default: "-s -w"
+      go_version:
+        description: Go version for actions/setup-go.
+        type: string
+        default: "stable"
+      include:
+        description: Comma-separated extra files to include in each archive.
+        type: string
+        default: "README.md,LICENSE"
+      cgo:
+        description: Set CGO_ENABLED=1 (disables cross-compilation for most workers).
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches worker version
+        if: inputs.version_check_cmd != ''
+        run: ${{ inputs.version_check_cmd }} "${GITHUB_REF_NAME}"
+      - name: Create the GitHub Release if it doesn't exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists."
+          else
+            gh release create "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+              --title "${GITHUB_REF_NAME}" --generate-notes
+          fi
+
+  upload:
+    name: ${{ matrix.platform }}
+    needs: [create-release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      ASSET_PREFIX: ${{ inputs.asset_prefix || github.event.repository.name }}
+      BIN: ${{ inputs.bin || github.event.repository.name }}
+      CGO_ENABLED: ${{ inputs.cgo && '1' || '0' }}
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, platform: linux_amd64 }
+          - { goos: linux,   goarch: arm64, platform: linux_arm64 }
+          - { goos: darwin,  goarch: amd64, platform: osx_amd64 }
+          - { goos: darwin,  goarch: arm64, platform: osx_arm64 }
+          - { goos: windows, goarch: amd64, platform: windows_amd64, ext: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+
+      - name: Build, archive, checksum, sign, attest, upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          EXT="${{ matrix.ext }}"
+          OUT="${BIN}${EXT}"
+          LDFLAGS="${{ inputs.ldflags }}"
+          LDFLAGS="${LDFLAGS//\$\{TAG\}/$TAG}"
+
+          echo "::group::build ${GOOS}/${GOARCH} (CGO_ENABLED=${CGO_ENABLED})"
+          go build -trimpath -ldflags "$LDFLAGS" -o "$OUT" "${{ inputs.package }}"
+          echo "::endgroup::"
+
+          # Assemble the archive contents: the binary + any include files present.
+          FILES=("$OUT")
+          IFS=',' read -ra INC <<< "${{ inputs.include }}"
+          for f in "${INC[@]}"; do f="${f// /}"; [ -n "$f" ] && [ -f "$f" ] && FILES+=("$f"); done
+
+          ARCHIVE="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.tar.gz"
+          SUM="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.sha256"
+          tar czf "$ARCHIVE" "${FILES[@]}"
+          sha256sum "$ARCHIVE" > "$SUM"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign + upload archive, checksum, bundle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          ARCHIVE="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.tar.gz"
+          SUM="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.sha256"
+          cosign sign-blob --yes --bundle "${ARCHIVE}.cosign.bundle" "$ARCHIVE"
+          gh release upload "$TAG" "$ARCHIVE" "$SUM" "${ARCHIVE}.cosign.bundle" --clobber
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.ASSET_PREFIX }}-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz

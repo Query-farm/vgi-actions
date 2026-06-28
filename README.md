@@ -83,84 +83,103 @@ Notes:
 - Multi-arch is fixed to amd64 + arm64 on native runners; that is the supported
   baseline.
 
-## `binary-release.yml` — cross-platform binary build & GitHub Release
+## Binary / artifact release workflows
 
-A reusable workflow for **binary-driven (Rust) workers**: it builds the worker
-binary for every supported platform and attaches the archives to the GitHub
-Release for a `vX.Y.Z` tag, each with a **SHA256**, a keyless **cosign
-signature** (`.cosign.bundle`), and a **SLSA build-provenance** attestation.
+Three language-specific reusable workflows attach a worker's release artifacts to
+the GitHub Release for a `vX.Y.Z` tag — each with a **SHA256**, a keyless
+**cosign signature** (`.cosign.bundle`), and a **SLSA build-provenance**
+attestation. All are `workflow_call`-only; the **caller gates on its own test
+suite** (`ci.yml` as a `needs:` job) and triggers on tags.
 
-Standardized so every worker ships the same shape:
+| Workflow | For | Artifacts |
+| --- | --- | --- |
+| `rust-release.yml` | Rust (cargo) workers | one `.tar.gz` per DuckDB platform |
+| `go-release.yml` | Go workers | one `.tar.gz` per DuckDB platform (cross-compiled) |
+| `java-release.yml` | Java (JVM) workers | one platform-independent `.jar` |
 
-- one **`.tar.gz` per DuckDB platform** (`linux_amd64`, `linux_arm64`,
-  `osx_amd64`, `osx_arm64`, `windows_amd64`) — Windows ships `.tar.gz` too (not
-  `.zip`), since the vgi client only reads `.tar.gz`. Assets are named
-  `<asset_prefix>-<tag>-<duckdb_platform>.tar.gz`.
-- macOS builds on **Apple Silicon** (`macos-15`); the Intel (`osx_amd64`) binary
-  is **cross-compiled** (the last Intel runner image, `macos-13`, is
-  scarce/deprecated). Every other target builds native.
+The binary workflows name assets `<asset_prefix>-<tag>-<duckdb_platform>.tar.gz`
+across the five DuckDB platforms (`linux_amd64`, `linux_arm64`, `osx_amd64`,
+`osx_arm64`, `windows_amd64`) — `.tar.gz` on **every** platform (Windows
+included; the vgi client only reads `.tar.gz`). Java publishes a single
+`<asset_prefix>-<tag>.jar`.
 
-### Usage
-
-`workflow_call`-only; the **caller gates on its own test suite**, then calls it:
-
-```yaml
-name: Release binaries
-on:
-  push:
-    tags: ['v*.*.*']
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  ci:
-    uses: ./.github/workflows/ci.yml          # gate: the repo's own suite
-  release:
-    needs: [ci]
-    permissions:
-      contents: write       # create Release + upload assets
-      id-token: write       # keyless cosign + provenance (sigstore OIDC)
-      attestations: write   # SLSA build-provenance
-    uses: Query-farm/vgi-actions/.github/workflows/binary-release.yml@v1
-    secrets: inherit
-    with:
-      bin: units-worker            # cargo bin to build (executable in the archive)
-      asset_prefix: vgi-units      # optional; defaults to the repo name
-      version_check_cmd: ci/check-version.sh
-```
-
-### Inputs
-
-| Input | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `bin` | yes | — | Cargo bin name to build and package (the executable inside each archive). |
-| `asset_prefix` | no | repo name | Archive base-name prefix → `<asset_prefix>-<tag>-<platform>.tar.gz`. |
-| `version_check_cmd` | no | `""` | Command run on a version-tag push with the tag as `$1` (e.g. `ci/check-version.sh`). Empty = skip. |
-| `include` | no | `README.md,LICENSE` | Comma-separated extra files to include in each archive. |
-
-### Verifying a release binary
-
-Signing runs in **this** workflow, so the keyless identity is
-`Query-farm/vgi-actions/.github/workflows/binary-release.yml` (same model as the
-signed images), not the caller's `release.yml`:
+Signing runs in **these** workflows, so the keyless cert identity is the
+vgi-actions workflow (`…/rust-release.yml`, `…/go-release.yml`,
+`…/java-release.yml`), the same model as the signed images — not the caller's
+`release.yml`. Verify, e.g.:
 
 ```sh
 cosign verify-blob \
-  --bundle vgi-units-v0.1.3-linux_amd64.tar.gz.cosign.bundle \
-  --certificate-identity-regexp '^https://github\.com/Query-farm/vgi-actions/\.github/workflows/binary-release\.yml@' \
+  --bundle vgi-units-v0.2.0-linux_amd64.tar.gz.cosign.bundle \
+  --certificate-identity-regexp '^https://github\.com/Query-farm/vgi-actions/\.github/workflows/rust-release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  vgi-units-v0.1.3-linux_amd64.tar.gz
+  vgi-units-v0.2.0-linux_amd64.tar.gz
 
-# Provenance (verify against the caller repo; the signer is vgi-actions):
-gh attestation verify vgi-units-v0.1.3-linux_amd64.tar.gz \
-  --repo Query-farm/vgi-units \
-  --signer-repo Query-farm/vgi-actions
+gh attestation verify vgi-units-v0.2.0-linux_amd64.tar.gz \
+  --repo Query-farm/vgi-units --signer-repo Query-farm/vgi-actions
 ```
 
-### Contract
+### `rust-release.yml`
 
-The workflow expects a Cargo workspace whose `bin` target builds with
-`cargo build --release --locked`. A `version_check_cmd` (if given) is a
-repo-local script taking the tag as `$1` and exiting non-zero on mismatch.
+Builds the `bin` for every DuckDB platform. macOS builds on **Apple Silicon**
+(`macos-15`); the Intel (`osx_amd64`) binary is **cross-compiled** (`macos-13` is
+deprecated). Cargo downloads are hardened against CDN flakes (`CARGO_NET_RETRY`,
+`CARGO_HTTP_MULTIPLEXING=false`).
+
+```yaml
+  release:
+    needs: [ci]
+    permissions: { contents: write, id-token: write, attestations: write }
+    uses: Query-farm/vgi-actions/.github/workflows/rust-release.yml@v1
+    secrets: inherit
+    with:
+      bin: units-worker            # cargo bin (executable inside the archive)
+      asset_prefix: vgi-units      # optional; defaults to the repo name
+      version_check_cmd: ci/check-version.sh   # optional
+```
+
+Inputs: `bin` (required), `asset_prefix` (default repo name), `version_check_cmd`
+(default skip), `include` (default `README.md,LICENSE`).
+
+### `go-release.yml`
+
+Cross-compiles all five platforms on one linux runner via `GOOS`/`GOARCH`
+(`CGO_ENABLED=0` by default). The Windows binary is `<bin>.exe` inside the
+`.tar.gz`.
+
+```yaml
+  release:
+    needs: [ci]
+    permissions: { contents: write, id-token: write, attestations: write }
+    uses: Query-farm/vgi-actions/.github/workflows/go-release.yml@v1
+    secrets: inherit
+    with:
+      bin: vgi-grpc                # output binary name; defaults to the repo name
+      package: ./cmd/worker        # go build target; default "."
+      ldflags: "-s -w -X main.version=${TAG}"   # ${TAG} -> release tag
+```
+
+Inputs: `bin` (default repo name), `package` (default `.`), `asset_prefix`
+(default repo name), `version_check_cmd`, `ldflags` (default `-s -w`),
+`go_version` (default `stable`), `include`, `cgo` (default `false`).
+
+### `java-release.yml`
+
+Builds one runnable fat jar (no platform matrix). The `jar` glob must point at
+the **uber/shaded** jar (not the thin jar).
+
+```yaml
+  release:
+    needs: [ci]
+    permissions: { contents: write, id-token: write, attestations: write }
+    uses: Query-farm/vgi-actions/.github/workflows/java-release.yml@v1
+    secrets: inherit
+    with:
+      jar: target/*-jar-with-dependencies.jar   # required: the runnable jar
+      build_cmd: "mvn -B -ntp -DskipTests package"
+      java_version: "21"
+```
+
+Inputs: `jar` (required), `build_cmd` (default `mvn -B -ntp -DskipTests
+package`), `asset_prefix` (default repo name), `version_check_cmd`,
+`java_version` (default `21`), `java_distribution` (default `temurin`).

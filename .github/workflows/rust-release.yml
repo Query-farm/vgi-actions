@@ -20,7 +20,7 @@
 #     SLSA build-provenance is attested.
 #
 # Because signing runs HERE, the keyless cert identity (and provenance builder)
-# is this workflow — Query-farm/vgi-actions/.github/workflows/binary-release.yml
+# is this workflow — Query-farm/vgi-actions/.github/workflows/rust-release.yml
 # — not the caller's release.yml, matching how docker-publish.yml signs images.
 # See README.md for the verify recipe.
 #
@@ -28,7 +28,7 @@
 # responsible for gating on its own test suite — run the repo's ci.yml as a
 # `needs:` job before the job that calls this. Tag context (vX.Y.Z) is read from
 # the caller's github context.
-name: binary-release (reusable)
+name: rust-release (reusable)
 
 on:
   workflow_call:
