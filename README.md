@@ -143,9 +143,11 @@ Inputs: `bin` (required), `asset_prefix` (default repo name), `version_check_cmd
 
 ### `go-release.yml`
 
-Cross-compiles all five platforms on one linux runner via `GOOS`/`GOARCH`
-(`CGO_ENABLED=0` by default). The Windows binary is `<bin>.exe` inside the
-`.tar.gz`.
+VGI Go workers embed DuckDB via the `vgi-go` SDK (`→ duckdb-go-bindings`), so
+they need **CGO**. Builds run on a **native runner per platform** (ubuntu
+amd64/arm64, macos-15 with the Intel binary cross-built via `clang -arch
+x86_64`, windows) with `CGO_ENABLED=1`, linking the prebuilt per-platform
+DuckDB lib. The Windows binary is `<bin>.exe` inside the `.tar.gz`.
 
 ```yaml
   release:
@@ -161,7 +163,8 @@ Cross-compiles all five platforms on one linux runner via `GOOS`/`GOARCH`
 
 Inputs: `bin` (default repo name), `package` (default `.`), `asset_prefix`
 (default repo name), `version_check_cmd`, `ldflags` (default `-s -w`),
-`go_version` (default `stable`), `include`, `cgo` (default `false`).
+`go_version` (default `stable`), `include`, `cgo` (default `1`; set `0` for a
+genuinely pure-Go worker).
 
 ### `java-release.yml`
 

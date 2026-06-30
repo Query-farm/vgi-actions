@@ -4,19 +4,20 @@
 # attach the archives (+ SHA256 + keyless cosign signature + SLSA provenance) to
 # the GitHub Release for a vX.Y.Z tag. The Go analogue of rust-release.yml.
 #
-# Go cross-compiles, so every DuckDB platform (linux_amd64, linux_arm64,
-# osx_amd64, osx_arm64, windows_amd64) is built on a SINGLE linux runner via
-# GOOS/GOARCH — no native macOS/Windows runners needed. Assets are named
+# Go VGI workers link DuckDB through the vgi-go SDK (vgi-go -> duckdb-go/v2 ->
+# duckdb-go-bindings), so they REQUIRE CGO. duckdb-go-bindings ships a prebuilt
+# static lib per platform, so each target builds on its NATIVE runner with
+# CGO_ENABLED=1 (pure-Go cross-compilation does not work — the binding files are
+# build-constraint-excluded without cgo). This mirrors rust-release.yml's matrix:
+# ubuntu (amd64 + arm64), macos-15 (osx_arm64 native, osx_amd64 cross-built with
+# clang -arch x86_64), windows. Assets are named
 # <asset_prefix>-<tag>-<duckdb_platform>.tar.gz (.tar.gz on every platform,
-# Windows included, since the vgi client only reads .tar.gz; the Windows binary
-# is <bin>.exe inside). Each archive is cosign sign-blob'd into a .cosign.bundle
-# and SLSA build-provenance attested. Builds default to CGO_ENABLED=0 (pure-Go
-# static cross-compile); set `cgo: true` only for a worker that needs it (then
-# cross-compilation typically won't work and you'd need a different matrix).
+# Windows included — the binary is <bin>.exe inside). Each archive is cosign
+# sign-blob'd into a .cosign.bundle and SLSA build-provenance attested.
 #
 # Signing runs HERE, so the keyless identity is this workflow
-# (Query-farm/vgi-actions/.github/workflows/go-release.yml). workflow_call
-# -only; the CALLER gates on its own test suite. See README.md.
+# (Query-farm/vgi-actions/.github/workflows/go-release.yml). workflow_call-only;
+# the CALLER gates on its own test suite. See README.md.
 name: go-release (reusable)
 
 on:
@@ -55,9 +56,11 @@ on:
         type: string
         default: "README.md,LICENSE"
       cgo:
-        description: Set CGO_ENABLED=1 (disables cross-compilation for most workers).
-        type: boolean
-        default: false
+        description: >-
+          CGO_ENABLED value. Defaults to 1 — VGI Go workers embed DuckDB and need
+          cgo. Set to 0 only for a genuinely pure-Go worker.
+        type: string
+        default: "1"
 
 permissions:
   contents: read
@@ -88,7 +91,6 @@ jobs:
     name: ${{ matrix.platform }}
     needs: [create-release]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
@@ -96,18 +98,23 @@ jobs:
     env:
       ASSET_PREFIX: ${{ inputs.asset_prefix || github.event.repository.name }}
       BIN: ${{ inputs.bin || github.event.repository.name }}
-      CGO_ENABLED: ${{ inputs.cgo && '1' || '0' }}
+      CGO_ENABLED: ${{ inputs.cgo }}
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
     strategy:
       fail-fast: false
       matrix:
+        # Native runner per platform with cgo. osx_amd64 is the one cross-build:
+        # macos-15 is Apple Silicon (macos-13, the last Intel image, is
+        # deprecated), so clang targets x86_64 via `-arch x86_64` and links the
+        # darwin-amd64 prebuilt lib.
         include:
-          - { goos: linux,   goarch: amd64, platform: linux_amd64 }
-          - { goos: linux,   goarch: arm64, platform: linux_arm64 }
-          - { goos: darwin,  goarch: amd64, platform: osx_amd64 }
-          - { goos: darwin,  goarch: arm64, platform: osx_arm64 }
-          - { goos: windows, goarch: amd64, platform: windows_amd64, ext: ".exe" }
+          - { os: ubuntu-latest,    goos: linux,   goarch: amd64, platform: linux_amd64 }
+          - { os: ubuntu-24.04-arm, goos: linux,   goarch: arm64, platform: linux_arm64 }
+          - { os: macos-15,         goos: darwin,  goarch: amd64, platform: osx_amd64, cc: "clang -arch x86_64", cxx: "clang++ -arch x86_64" }
+          - { os: macos-15,         goos: darwin,  goarch: arm64, platform: osx_arm64 }
+          - { os: windows-latest,   goos: windows, goarch: amd64, platform: windows_amd64, ext: ".exe" }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -115,10 +122,8 @@ jobs:
         with:
           go-version: ${{ inputs.go_version }}
 
-      - name: Build, archive, checksum, sign, attest, upload
+      - name: Build, archive, checksum
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
@@ -126,12 +131,13 @@ jobs:
           OUT="${BIN}${EXT}"
           LDFLAGS="${{ inputs.ldflags }}"
           LDFLAGS="${LDFLAGS//\$\{TAG\}/$TAG}"
+          # Cross C compiler for the osx_amd64 leg only (empty otherwise).
+          if [ -n "${{ matrix.cc }}" ]; then export CC="${{ matrix.cc }}" CXX="${{ matrix.cxx }}"; fi
 
-          echo "::group::build ${GOOS}/${GOARCH} (CGO_ENABLED=${CGO_ENABLED})"
+          echo "::group::build ${GOOS}/${GOARCH} (CGO_ENABLED=${CGO_ENABLED}${CC:+, CC=$CC})"
           go build -trimpath -ldflags "$LDFLAGS" -o "$OUT" "${{ inputs.package }}"
           echo "::endgroup::"
 
-          # Assemble the archive contents: the binary + any include files present.
           FILES=("$OUT")
           IFS=',' read -ra INC <<< "${{ inputs.include }}"
           for f in "${INC[@]}"; do f="${f// /}"; [ -n "$f" ] && [ -f "$f" ] && FILES+=("$f"); done
