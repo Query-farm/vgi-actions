@@ -83,6 +83,42 @@ Notes:
 - Multi-arch is fixed to amd64 + arm64 on native runners; that is the supported
   baseline.
 
+## `ts-ci.yml` — TypeScript / Bun CI
+
+A reusable CI workflow for TypeScript / Bun VGI worker repos (e.g. the
+`vgi-azure-*` family). `workflow_call`-only; it checks out the caller, sets up
+Bun, installs with a frozen lockfile, typechecks, and runs the bun test suite.
+
+```yaml
+name: CI
+on:
+  push: { branches: [main], paths-ignore: ['README.md'] }
+  pull_request: { branches: [main], paths-ignore: ['README.md'] }
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: Query-farm/vgi-actions/.github/workflows/ts-ci.yml@main
+    # with:
+    #   os: '["ubuntu-latest", "macos-latest"]'   # default: '["ubuntu-latest"]'
+    #   bun-version: 'latest'
+```
+
+The repo must define a **`typecheck`** script (e.g. `"typecheck": "tsc --noEmit"`)
+and keep bun tests under `test/`. Steps: `actions/checkout@v4` →
+`oven-sh/setup-bun@v2` → `bun install --frozen-lockfile` → `bun run typecheck` →
+`bun test`.
+
+### Inputs
+
+| Input | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `os` | no | `'["ubuntu-latest"]'` | JSON array of runner OSes to matrix over. |
+| `bun-version` | no | `latest` | Bun version for `oven-sh/setup-bun`. |
+
 ## Binary / artifact release workflows
 
 Three language-specific reusable workflows attach a worker's release artifacts to

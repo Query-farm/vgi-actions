@@ -1,0 +1,40 @@
+name: ts-ci
+
+# Reusable CI for TypeScript / Bun VGI worker repos: install, typecheck, unit tests.
+# workflow_call-only — a repo's own .github/workflows/ci.yml calls this. The repo
+# must define a `typecheck` script (e.g. "tsc --noEmit") and have bun tests under test/.
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: 'JSON array of runner OSes to matrix over.'
+        type: string
+        default: '["ubuntu-latest"]'
+      bun-version:
+        description: 'Bun version for oven-sh/setup-bun.'
+        type: string
+        default: 'latest'
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.os) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Test
+        run: bun test
