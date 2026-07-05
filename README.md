@@ -131,6 +131,7 @@ suite** (`ci.yml` as a `needs:` job) and triggers on tags.
 | --- | --- | --- |
 | `rust-release.yml` | Rust (cargo) workers | one `.tar.gz` per DuckDB platform |
 | `go-release.yml` | Go workers | one `.tar.gz` per DuckDB platform (cross-compiled) |
+| `ts-release.yml` | TypeScript / Bun workers | one `.tar.gz` per DuckDB platform (a compiled Bun single-file executable) |
 | `java-release.yml` | Java (JVM) workers | one platform-independent `.jar` |
 
 The binary workflows name assets `<asset_prefix>-<tag>-<duckdb_platform>.tar.gz`
@@ -138,6 +139,10 @@ across the five DuckDB platforms (`linux_amd64`, `linux_arm64`, `osx_amd64`,
 `osx_arm64`, `windows_amd64`) — `.tar.gz` on **every** platform (Windows
 included; the vgi client only reads `.tar.gz`). Java publishes a single
 `<asset_prefix>-<tag>.jar`.
+
+The keyless cert identity for a TS release is
+`…/ts-release.yml` (substitute it for `rust-release.yml` in the `cosign
+verify-blob` example above).
 
 Signing runs in **these** workflows, so the keyless cert identity is the
 vgi-actions workflow (`…/rust-release.yml`, `…/go-release.yml`,
@@ -201,6 +206,32 @@ Inputs: `bin` (default repo name), `package` (default `.`), `asset_prefix`
 (default repo name), `version_check_cmd`, `ldflags` (default `-s -w`),
 `go_version` (default `stable`), `include`, `cgo` (default `1`; set `0` for a
 genuinely pure-Go worker).
+
+### `ts-release.yml`
+
+Compiles the worker entry (`Worker.run()`) into a **Bun single-file executable**
+for every DuckDB platform with `bun build --compile --target=bun-<os>-<arch>`.
+Bun cross-compiles all five from one ubuntu runner (no native-runner matrix), so
+it is the cheapest of the binary workflows. The archive holds a self-contained
+executable — DuckDB `ATTACH`es it directly; the target host needs neither Bun nor
+`node_modules`. The Windows binary is `<bin>.exe` inside the `.tar.gz`.
+
+```yaml
+  release:
+    needs: [ci]
+    permissions: { contents: write, id-token: write, attestations: write }
+    uses: Query-farm/vgi-actions/.github/workflows/ts-release.yml@v1
+    secrets: inherit
+    with:
+      bin: vgi-yfinance-worker     # output binary name; defaults to the repo name
+      entry: src/worker.ts         # the file that calls Worker.run(); default src/worker.ts
+      version_check_cmd: ci/check-version.sh   # optional
+```
+
+Inputs: `entry` (default `src/worker.ts`), `bin` (default repo name),
+`asset_prefix` (default repo name), `version_check_cmd`, `bun_build_args`
+(extra `bun build --compile` flags; `${TAG}` → the release tag), `bun-version`
+(default `latest`), `include` (default `README.md,LICENSE`).
 
 ### `java-release.yml`
 

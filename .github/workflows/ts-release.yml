@@ -1,0 +1,161 @@
+# Copyright 2026 Query Farm LLC - https://query.farm
+#
+# Reusable workflow: compile a TypeScript / Bun VGI worker into a standalone
+# single-file executable for every supported platform and attach the archives
+# (+ SHA256 + keyless cosign signature + SLSA provenance) to the GitHub Release
+# for a vX.Y.Z tag. The TypeScript analogue of rust-release.yml / go-release.yml.
+#
+# Unlike the Rust/Go workflows, no native-runner matrix is needed: Bun
+# cross-compiles every target from a single ubuntu runner via
+# `bun build --compile --target=bun-<os>-<arch>` (it downloads the matching
+# prebuilt Bun runtime and embeds it + the bundled app into one executable). The
+# result is a self-contained binary that DuckDB ATTACHes directly — no Bun, no
+# node_modules on the target host. Assets are named
+# <asset_prefix>-<tag>-<duckdb_platform>.tar.gz (.tar.gz on every platform,
+# Windows included — the binary is <bin>.exe inside). Each archive is cosign
+# sign-blob'd into a .cosign.bundle and SLSA build-provenance attested.
+#
+# Signing runs HERE, so the keyless identity is this workflow
+# (Query-farm/vgi-actions/.github/workflows/ts-release.yml). workflow_call-only;
+# the CALLER gates on its own test suite. See README.md.
+name: ts-release (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      entry:
+        description: The worker entry point to compile (the file that calls Worker.run()).
+        type: string
+        default: "src/worker.ts"
+      bin:
+        description: Output binary name (the executable inside each archive). Defaults to the repo name.
+        type: string
+        default: ""
+      asset_prefix:
+        description: Archive base-name prefix. Defaults to the repository name.
+        type: string
+        default: ""
+      version_check_cmd:
+        description: >-
+          Command run on a version-tag push with the tag appended as $1, to
+          assert the tag matches the worker version. Empty = skip.
+        type: string
+        default: ""
+      bun_build_args:
+        description: >-
+          Extra flags appended to `bun build --compile` (e.g. "--minify" or
+          "--define PACKAGE_VERSION='\"${TAG}\"'"). ${TAG} -> the release tag.
+        type: string
+        default: ""
+      bun-version:
+        description: Bun version for oven-sh/setup-bun.
+        type: string
+        default: "latest"
+      include:
+        description: Comma-separated extra files to include in each archive.
+        type: string
+        default: "README.md,LICENSE"
+
+permissions:
+  contents: read
+
+jobs:
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - name: Verify tag matches worker version
+        if: inputs.version_check_cmd != ''
+        run: ${{ inputs.version_check_cmd }} "${GITHUB_REF_NAME}"
+      - name: Create the GitHub Release if it doesn't exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists."
+          else
+            gh release create "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+              --title "${GITHUB_REF_NAME}" --generate-notes
+          fi
+
+  upload:
+    name: ${{ matrix.platform }}
+    needs: [create-release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      ASSET_PREFIX: ${{ inputs.asset_prefix || github.event.repository.name }}
+      BIN: ${{ inputs.bin || github.event.repository.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every leg cross-compiles on ubuntu; `target` selects the embedded Bun
+        # runtime. `platform` is the DuckDB platform name used in the asset name.
+        include:
+          - { target: bun-linux-x64,     platform: linux_amd64 }
+          - { target: bun-linux-arm64,   platform: linux_arm64 }
+          - { target: bun-darwin-x64,    platform: osx_amd64 }
+          - { target: bun-darwin-arm64,  platform: osx_arm64 }
+          - { target: bun-windows-x64,   platform: windows_amd64, ext: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Compile, archive, checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          EXT="${{ matrix.ext }}"
+          OUT="${BIN}${EXT}"
+          EXTRA="${{ inputs.bun_build_args }}"
+          EXTRA="${EXTRA//\$\{TAG\}/$TAG}"
+
+          echo "::group::compile ${{ matrix.target }} -> ${OUT}"
+          bun build "${{ inputs.entry }}" --compile --target="${{ matrix.target }}" $EXTRA --outfile "$OUT"
+          echo "::endgroup::"
+
+          FILES=("$OUT")
+          IFS=',' read -ra INC <<< "${{ inputs.include }}"
+          for f in "${INC[@]}"; do f="${f// /}"; [ -n "$f" ] && [ -f "$f" ] && FILES+=("$f"); done
+
+          ARCHIVE="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.tar.gz"
+          SUM="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.sha256"
+          tar czf "$ARCHIVE" "${FILES[@]}"
+          sha256sum "$ARCHIVE" > "$SUM"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign + upload archive, checksum, bundle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          ARCHIVE="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.tar.gz"
+          SUM="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.sha256"
+          cosign sign-blob --yes --bundle "${ARCHIVE}.cosign.bundle" "$ARCHIVE"
+          gh release upload "$TAG" "$ARCHIVE" "$SUM" "${ARCHIVE}.cosign.bundle" --clobber
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.ASSET_PREFIX }}-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
