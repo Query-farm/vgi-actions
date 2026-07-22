@@ -54,6 +54,17 @@ on:
         description: Comma-separated extra files to include in each archive.
         type: string
         default: "README.md,LICENSE"
+      wasm_runtime_version:
+        description: >-
+          @query-farm/vgi-worker-runtime version whose SAB ring lib/pre/boot the
+          wasm build links (fetched from jsdelivr). Only used when wasm/build.sh
+          exists.
+        type: string
+        default: "0.1.0"
+      wasm_emsdk_version:
+        description: emsdk version for the wasm build (only used when wasm/build.sh exists).
+        type: string
+        default: "5.0.1"
 
 permissions:
   contents: read
@@ -170,3 +181,93 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ env.ASSET_PREFIX }}-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
+
+  # Browser (wasm32) build — OPT-IN BY FILE PRESENCE: runs only when the repo has
+  # a wasm/build.sh (the workers that build to DuckDB-WASM). Others no-op. Emits
+  # vgi_worker.{js,wasm} + vgi-worker-boot.js as a signed, attested wasm archive.
+  wasm:
+    name: wasm32
+    needs: [create-release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # upload release assets
+      id-token: write     # keyless cosign + provenance
+      attestations: write
+    env:
+      ASSET_PREFIX: ${{ inputs.asset_prefix || github.event.repository.name }}
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Gate the whole job on wasm/build.sh so this workflow stays safe for Rust
+      # workers that do NOT ship a browser build.
+      - name: Detect wasm build
+        id: detect
+        shell: bash
+        run: |
+          if [ -f wasm/build.sh ]; then echo "has=true" >> "$GITHUB_OUTPUT"; else echo "has=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Install Rust nightly (build-std) + wasm target
+        if: steps.detect.outputs.has == 'true'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-emscripten
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.detect.outputs.has == 'true'
+        with:
+          key: wasm32-emscripten
+
+      - name: Install emsdk
+        if: steps.detect.outputs.has == 'true'
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ inputs.wasm_emsdk_version }}
+
+      - name: Build wasm worker + upload to the Release (signed + attested)
+        if: steps.detect.outputs.has == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Shared SAB ring runtime (lib/pre/boot) from the published package — the
+          # same three files every browser VGI worker links. No vgi-repo checkout.
+          V="${{ inputs.wasm_runtime_version }}"
+          base="https://cdn.jsdelivr.net/npm/@query-farm/vgi-worker-runtime@${V}/wasm"
+          mkdir -p .vgi-runtime
+          for f in vgi_worker_lib.js vgi_worker_pre.js vgi-worker-boot.js; do
+            curl -sSfL "$base/$f" -o ".vgi-runtime/$f"
+          done
+          VGI_WORKER_RUNTIME="$PWD/.vgi-runtime" EMSDK_DIR="$EMSDK" ./wasm/build.sh
+          test -s wasm/dist/vgi_worker.wasm
+
+          # Package the browser bundle (module + wasm + boot) like the binary archives.
+          arc="${ASSET_PREFIX}-${GITHUB_REF_NAME}-wasm.tar.gz"
+          tar -C wasm/dist -czf "$arc" vgi_worker.js vgi_worker.wasm vgi-worker-boot.js
+          sha256sum "$arc" > "${arc}.sha256"
+          gh release upload "${GITHUB_REF_NAME}" "$arc" "${arc}.sha256" --clobber
+          echo "ARCHIVE=$arc" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        if: steps.detect.outputs.has == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign wasm archive (keyless) and attach bundle
+        if: steps.detect.outputs.has == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle "${ARCHIVE}.cosign.bundle" "${ARCHIVE}"
+          gh release upload "${GITHUB_REF_NAME}" "${ARCHIVE}.cosign.bundle" --clobber
+
+      - name: Attest wasm build provenance
+        if: steps.detect.outputs.has == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.ARCHIVE }}
