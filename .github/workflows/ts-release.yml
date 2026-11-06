@@ -101,10 +101,10 @@ jobs:
       matrix:
         # Every leg cross-compiles on ubuntu; `target` selects the embedded Bun
         # runtime. `platform` is the DuckDB platform name used in the asset name.
+        # No osx_amd64: DuckDB 2.0 / haybarn 2.0 dropped macOS on Intel.
         include:
           - { target: bun-linux-x64,     platform: linux_amd64 }
           - { target: bun-linux-arm64,   platform: linux_arm64 }
-          - { target: bun-darwin-x64,    platform: osx_amd64 }
           - { target: bun-darwin-arm64,  platform: osx_arm64 }
           - { target: bun-windows-x64,   platform: windows_amd64, ext: ".exe" }
     steps:

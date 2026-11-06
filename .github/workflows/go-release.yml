@@ -104,9 +104,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Native runner per platform with cgo. No osx_amd64: haybarn 2.0 ships no
-        # darwin-amd64 libhaybarn (and haybarn-go-bindings has no
-        # prebuilt_darwin_amd64), so that leg cannot link.
+        # Native runner per platform with cgo. No osx_amd64: DuckDB 2.0 / haybarn
+        # 2.0 dropped macOS on Intel (no darwin-amd64 libhaybarn to link).
         include:
           - { os: ubuntu-latest,    goos: linux,   goarch: amd64, platform: linux_amd64 }
           - { os: ubuntu-24.04-arm, goos: linux,   goarch: arm64, platform: linux_arm64 }

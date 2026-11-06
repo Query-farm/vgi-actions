@@ -9,12 +9,12 @@
 #
 # Standardized for binary-driven (Rust) workers:
 #   - one .tar.gz per DuckDB platform name (duckdb_platform(): linux_amd64,
-#     linux_arm64, osx_amd64, osx_arm64, windows_amd64) — Windows ships .tar.gz
+#     linux_arm64, osx_arm64, windows_amd64) — Windows ships .tar.gz
 #     too (NOT .zip), because the vgi client only consumes .tar.gz. Assets are
 #     named <asset_prefix>-<tag>-<duckdb_platform>.tar.gz.
-#   - macOS builds on a current Apple-Silicon runner (macos-15); the Intel
-#     (osx_amd64) binary is CROSS-compiled via --target (macos-13, the last Intel
-#     image, is scarce/deprecated). Every other target builds native.
+#   - macOS builds on a current Apple-Silicon runner (macos-15). No osx_amd64:
+#     DuckDB 2.0 / haybarn 2.0 dropped macOS on Intel, so nothing could load it.
+#     Every target builds native.
 #   - each archive is cosign sign-blob'd (keyless: Fulcio cert + Rekor log, no
 #     stored key) into a self-contained .cosign.bundle attached next to it, and
 #     SLSA build-provenance is attested.
@@ -118,7 +118,6 @@ jobs:
         include:
           - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  platform: linux_amd64 }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, platform: linux_arm64 }
-          - { os: macos-15,         target: x86_64-apple-darwin,       platform: osx_amd64 }
           - { os: macos-15,         target: aarch64-apple-darwin,      platform: osx_arm64 }
           - { os: windows-latest,   target: x86_64-pc-windows-msvc,    platform: windows_amd64 }
     runs-on: ${{ matrix.os }}
