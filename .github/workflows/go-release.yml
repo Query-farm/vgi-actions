@@ -9,8 +9,8 @@
 # static lib per platform, so each target builds on its NATIVE runner with
 # CGO_ENABLED=1 (pure-Go cross-compilation does not work — the binding files are
 # build-constraint-excluded without cgo). This mirrors rust-release.yml's matrix:
-# ubuntu (amd64 + arm64), macos-15 (osx_arm64 native, osx_amd64 cross-built with
-# clang -arch x86_64), windows. Assets are named
+# ubuntu (amd64 + arm64), macos-15 (osx_arm64), windows. No osx_amd64 (haybarn
+# 2.0 has no darwin-amd64 lib). Assets are named
 # <asset_prefix>-<tag>-<duckdb_platform>.tar.gz (.tar.gz on every platform,
 # Windows included — the binary is <bin>.exe inside). Each archive is cosign
 # sign-blob'd into a .cosign.bundle and SLSA build-provenance attested.
@@ -104,14 +104,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Native runner per platform with cgo. osx_amd64 is the one cross-build:
-        # macos-15 is Apple Silicon (macos-13, the last Intel image, is
-        # deprecated), so clang targets x86_64 via `-arch x86_64` and links the
-        # darwin-amd64 prebuilt lib.
+        # Native runner per platform with cgo. No osx_amd64: haybarn 2.0 ships no
+        # darwin-amd64 libhaybarn (and haybarn-go-bindings has no
+        # prebuilt_darwin_amd64), so that leg cannot link.
         include:
           - { os: ubuntu-latest,    goos: linux,   goarch: amd64, platform: linux_amd64 }
           - { os: ubuntu-24.04-arm, goos: linux,   goarch: arm64, platform: linux_arm64 }
-          - { os: macos-15,         goos: darwin,  goarch: amd64, platform: osx_amd64, cc: "clang -arch x86_64", cxx: "clang++ -arch x86_64" }
           - { os: macos-15,         goos: darwin,  goarch: arm64, platform: osx_arm64 }
           - { os: windows-latest,   goos: windows, goarch: amd64, platform: windows_amd64, ext: ".exe" }
     runs-on: ${{ matrix.os }}
