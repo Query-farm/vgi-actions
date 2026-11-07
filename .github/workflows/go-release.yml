@@ -11,9 +11,12 @@
 # build-constraint-excluded without cgo). This mirrors rust-release.yml's matrix:
 # ubuntu (amd64 + arm64), macos-15 (osx_arm64), windows. No osx_amd64 (haybarn
 # 2.0 has no darwin-amd64 lib). Assets are named
-# <asset_prefix>-<tag>-<duckdb_platform>.tar.gz (.tar.gz on every platform,
-# Windows included — the binary is <bin>.exe inside). Each archive is cosign
-# sign-blob'd into a .cosign.bundle and SLSA build-provenance attested.
+# <asset_prefix>-<tag>-<duckdb_platform>.tar.gz on every platform, plus a .zip
+# for windows_* (the binary is <bin>.exe inside) — the layout the vgi extension's
+# `github-auto://owner/repo@tag` transport resolves with no #path= fragment.
+# Linux legs link inside a manylinux_2_28 container (glibc >= 2.28 portable).
+# Each archive is cosign sign-blob'd into a .cosign.bundle and SLSA
+# build-provenance attested.
 #
 # Signing runs HERE, so the keyless identity is this workflow
 # (Query-farm/vgi-actions/.github/workflows/go-release.yml). workflow_call-only;
@@ -98,6 +101,7 @@ jobs:
     env:
       ASSET_PREFIX: ${{ inputs.asset_prefix || github.event.repository.name }}
       BIN: ${{ inputs.bin || github.event.repository.name }}
+      PLATFORM: ${{ matrix.platform }}
       CGO_ENABLED: ${{ inputs.cgo }}
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
@@ -106,9 +110,15 @@ jobs:
       matrix:
         # Native runner per platform with cgo. No osx_amd64: DuckDB 2.0 / haybarn
         # 2.0 dropped macOS on Intel (no darwin-amd64 libhaybarn to link).
+        #
+        # Linux legs compile + link INSIDE a manylinux_2_28 container (glibc 2.28,
+        # gcc-toolset with libstdc++_nonshared), so the binary runs on any glibc
+        # >= 2.28 (RHEL/Alma/Rocky 8+, Amazon Linux 2023, Debian 10+) instead of
+        # only on the runner's own (ubuntu-latest = 26.04) glibc. zig cc is not an
+        # option: libhaybarn is GCC/libstdc++-built C++, zig links libc++.
         include:
-          - { os: ubuntu-latest,    goos: linux,   goarch: amd64, platform: linux_amd64 }
-          - { os: ubuntu-24.04-arm, goos: linux,   goarch: arm64, platform: linux_arm64 }
+          - { os: ubuntu-latest,    goos: linux,   goarch: amd64, platform: linux_amd64, manylinux: "quay.io/pypa/manylinux_2_28_x86_64" }
+          - { os: ubuntu-24.04-arm, goos: linux,   goarch: arm64, platform: linux_arm64, manylinux: "quay.io/pypa/manylinux_2_28_aarch64" }
           - { os: macos-15,         goos: darwin,  goarch: arm64, platform: osx_arm64 }
           - { os: windows-latest,   goos: windows, goarch: amd64, platform: windows_amd64, ext: ".exe" }
     runs-on: ${{ matrix.os }}
@@ -119,47 +129,118 @@ jobs:
         with:
           go-version: ${{ inputs.go_version }}
 
-      - name: Build, archive, checksum
+      - name: Build
         shell: bash
+        env:
+          MANYLINUX: ${{ matrix.manylinux }}
+          PKG: ${{ inputs.package }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          EXT="${{ matrix.ext }}"
-          OUT="${BIN}${EXT}"
+          export OUT="${BIN}${{ matrix.ext }}"
           LDFLAGS="${{ inputs.ldflags }}"
-          LDFLAGS="${LDFLAGS//\$\{TAG\}/$TAG}"
-          # Cross C compiler for the osx_amd64 leg only (empty otherwise).
-          if [ -n "${{ matrix.cc }}" ]; then export CC="${{ matrix.cc }}" CXX="${{ matrix.cxx }}"; fi
+          export LDFLAGS="${LDFLAGS//\$\{TAG\}/$TAG}"
+          export PKG
 
-          echo "::group::build ${GOOS}/${GOARCH} (CGO_ENABLED=${CGO_ENABLED}${CC:+, CC=$CC})"
-          go build -trimpath -ldflags "$LDFLAGS" -o "$OUT" "${{ inputs.package }}"
+          echo "::group::build ${GOOS}/${GOARCH} (CGO_ENABLED=${CGO_ENABLED}${MANYLINUX:+, in $MANYLINUX})"
+          if [ -n "$MANYLINUX" ] && [ "$CGO_ENABLED" = "1" ]; then
+            # Resolve modules (and any go.mod `toolchain`) on the host; the
+            # container reuses the host GOROOT + module cache read-through.
+            go mod download
+            GOROOT_HOST="$(go env GOROOT)"
+            GOMODCACHE_HOST="$(go env GOMODCACHE)"
+            # -lrt: shm_open/shm_unlink live in librt before glibc 2.34.
+            docker run --rm --user "$(id -u):$(id -g)" \
+              -e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOMODCACHE=/gomod \
+              -e CGO_ENABLED -e GOOS -e GOARCH -e CGO_LDFLAGS="-lrt" \
+              -e OUT -e LDFLAGS -e PKG \
+              -v "$GOROOT_HOST:/goroot:ro" -v "$GOMODCACHE_HOST:/gomod" \
+              -v "$PWD:/src" -w /src \
+              "$MANYLINUX" \
+              bash -c 'export PATH=/goroot/bin:$PATH; git config --global --add safe.directory /src 2>/dev/null || true; go build -trimpath -ldflags "$LDFLAGS" -o "$OUT" "$PKG"'
+          else
+            go build -trimpath -ldflags "$LDFLAGS" -o "$OUT" "$PKG"
+          fi
           echo "::endgroup::"
+          test -s "$OUT"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
 
-          FILES=("$OUT")
+      # Fail the release if a Linux binary needs a glibc newer than 2.28.
+      - name: Check glibc symbol versions (Linux)
+        if: matrix.manylinux != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          max=$(objdump -T "$OUT" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "max GLIBC symbol version: ${max:-none}"
+          if [ -n "$max" ] && [ "$(printf '%s\n2.28\n' "$max" | sort -V | tail -1)" != "2.28" ]; then
+            echo "::error::$OUT requires GLIBC_$max (> 2.28)"; exit 1
+          fi
+
+      # Package in the layout the vgi extension's github-auto:// transport
+      # expects (see vgi docs/github-transport.md):
+      #   <prefix>-<tag>-<platform>.tar.gz — every platform; the worker is the ONLY
+      #     exec-bit member at the archive root (README/LICENSE forced to 0644),
+      #     so github-auto picks it with no #path= fragment.
+      #   <prefix>-<tag>-<platform>.zip    — windows_* only (github-auto fetches
+      #     .zip on Windows); <bin>.exe is the only .exe member.
+      #   <prefix>-<tag>-<platform>.sha256 — sha256sum lines for the archive(s).
+      #     github-auto reads the FIRST digest in it, so on Windows the .zip line
+      #     comes first; `sha256sum -c` still verifies every archive.
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          STEM="${ASSET_PREFIX}-${GITHUB_REF_NAME}-${PLATFORM}"
+          STAGE=".vgi-pkg-stage"   # workspace-relative: Windows-safe for msys tar + native 7z
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          NAME="$(basename "$OUT")"
+          cp "$OUT" "$STAGE/$NAME"; chmod 0755 "$STAGE/$NAME"
+          FILES=("$NAME")
           IFS=',' read -ra INC <<< "${{ inputs.include }}"
-          for f in "${INC[@]}"; do f="${f// /}"; [ -n "$f" ] && [ -f "$f" ] && FILES+=("$f"); done
-
-          ARCHIVE="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.tar.gz"
-          SUM="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.sha256"
-          tar czf "$ARCHIVE" "${FILES[@]}"
-          sha256sum "$ARCHIVE" > "$SUM"
+          for f in "${INC[@]}"; do
+            f="${f// /}"
+            if [ -n "$f" ] && [ -f "$f" ]; then
+              cp "$f" "$STAGE/$(basename "$f")"; chmod 0644 "$STAGE/$(basename "$f")"; FILES+=("$(basename "$f")")
+            fi
+          done
+          ARCHIVES=()
+          if [[ "$PLATFORM" == windows_* ]]; then
+            if command -v 7z >/dev/null; then (cd "$STAGE" && 7z a -tzip -bd "../${STEM}.zip" "${FILES[@]}" >/dev/null); else (cd "$STAGE" && zip -q -X "../${STEM}.zip" "${FILES[@]}"); fi
+            ARCHIVES+=("${STEM}.zip")
+          fi
+          COPYFILE_DISABLE=1 tar -C "$STAGE" -czf "${STEM}.tar.gz" "${FILES[@]}"
+          ARCHIVES+=("${STEM}.tar.gz")
+          if command -v sha256sum >/dev/null; then sha256sum "${ARCHIVES[@]}"; else shasum -a 256 "${ARCHIVES[@]}"; fi > "${STEM}.sha256"
+          cat "${STEM}.sha256"
+          tar -tvzf "${STEM}.tar.gz"
+          echo "archives=${ARCHIVES[*]}" >> "$GITHUB_OUTPUT"
+          { echo "subjects<<EOF"; printf '%s\n' "${ARCHIVES[@]}"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          echo "sidecar=${STEM}.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign + upload archive, checksum, bundle
+      # Keyless sigstore signature for each archive, mirroring docker-publish's
+      # `cosign sign`. Writes a self-contained .cosign.bundle (signature + cert +
+      # Rekor entry) per archive; everything is attached to the Release.
+      - name: Sign + upload archives, checksum, bundles
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          ARCHIVE="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.tar.gz"
-          SUM="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.sha256"
-          cosign sign-blob --yes --bundle "${ARCHIVE}.cosign.bundle" "$ARCHIVE"
-          gh release upload "$TAG" "$ARCHIVE" "$SUM" "${ARCHIVE}.cosign.bundle" --clobber
+          UPLOAD=("${{ steps.pkg.outputs.sidecar }}")
+          for f in ${{ steps.pkg.outputs.archives }}; do
+            cosign sign-blob --yes --bundle "${f}.cosign.bundle" "$f"
+            UPLOAD+=("$f" "${f}.cosign.bundle")
+          done
+          gh release upload "${GITHUB_REF_NAME}" "${UPLOAD[@]}" --clobber
 
+      # SLSA build-provenance attestation for the archive(s) — keyless/sigstore,
+      # stored in GitHub's attestation API (verify with `gh attestation verify`).
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ${{ env.ASSET_PREFIX }}-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
+          subject-path: ${{ steps.pkg.outputs.subjects }}

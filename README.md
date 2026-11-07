@@ -135,10 +135,24 @@ suite** (`ci.yml` as a `needs:` job) and triggers on tags.
 | `java-release.yml` | Java (JVM) workers | one platform-independent `.jar` |
 
 The binary workflows name assets `<asset_prefix>-<tag>-<duckdb_platform>.tar.gz`
-across the five DuckDB platforms (`linux_amd64`, `linux_arm64`, `osx_amd64`,
-`osx_arm64`, `windows_amd64`) — `.tar.gz` on **every** platform (Windows
-included; the vgi client only reads `.tar.gz`). Java publishes a single
-`<asset_prefix>-<tag>.jar`.
+across the four DuckDB platforms (`linux_amd64`, `linux_arm64`, `osx_arm64`,
+`windows_amd64`; no `osx_amd64` — DuckDB/haybarn 2.0 dropped Intel macOS) —
+`.tar.gz` on every platform, **plus** a `.zip` on `windows_amd64`, and one
+`<asset_prefix>-<tag>-<duckdb_platform>.sha256` sidecar per platform (on Windows
+it lists the `.zip` first, then the `.tar.gz`). The worker executable is the
+only exec-bit file (`.exe` on Windows) at the archive root. That is exactly the
+convention the vgi extension's `github-auto://` transport resolves, so on every
+platform a worker attaches with no fragment:
+
+```sql
+ATTACH 'units' (TYPE vgi, LOCATION 'github-auto://Query-farm/vgi-units@v0.2.0');
+```
+
+Linux binaries target **glibc 2.28** (Rust: `cargo zigbuild --target
+<triple>.2.28`; Go: built inside `quay.io/pypa/manylinux_2_28_*`; Bun's runtime
+needs 2.17), so they run on RHEL/Alma/Rocky 8+, Amazon Linux 2023, Debian 10+.
+The Rust/Go release fails if a Linux binary references a `GLIBC_` symbol newer
+than 2.28. Java publishes a single `<asset_prefix>-<tag>.jar`.
 
 The keyless cert identity for a TS release is
 `…/ts-release.yml` (substitute it for `rust-release.yml` in the `cosign
@@ -163,8 +177,7 @@ gh attestation verify vgi-units-v0.2.0-linux_amd64.tar.gz \
 ### `rust-release.yml`
 
 Builds the `bin` for every DuckDB platform. macOS builds on **Apple Silicon**
-(`macos-15`); the Intel (`osx_amd64`) binary is **cross-compiled** (`macos-13` is
-deprecated). Cargo downloads are hardened against CDN flakes (`CARGO_NET_RETRY`,
+(`macos-15`); Linux legs use `cargo-zigbuild` against glibc 2.28. Cargo downloads are hardened against CDN flakes (`CARGO_NET_RETRY`,
 `CARGO_HTTP_MULTIPLEXING=false`).
 
 ```yaml
@@ -186,9 +199,11 @@ Inputs: `bin` (required), `asset_prefix` (default repo name), `version_check_cmd
 
 VGI Go workers embed DuckDB via the `vgi-go` SDK (`→ duckdb-go-bindings`), so
 they need **CGO**. Builds run on a **native runner per platform** (ubuntu
-amd64/arm64, macos-15 with the Intel binary cross-built via `clang -arch
-x86_64`, windows) with `CGO_ENABLED=1`, linking the prebuilt per-platform
-DuckDB lib. The Windows binary is `<bin>.exe` inside the `.tar.gz`.
+amd64/arm64, macos-15, windows) with `CGO_ENABLED=1`, linking the prebuilt
+per-platform DuckDB lib; the Linux legs compile and link inside a
+`manylinux_2_28` container (with `CGO_LDFLAGS=-lrt`, since `shm_open` lives in
+librt before glibc 2.34). The Windows binary is `<bin>.exe` inside the
+`.zip`/`.tar.gz`.
 
 ```yaml
   release:
@@ -214,7 +229,7 @@ for every DuckDB platform with `bun build --compile --target=bun-<os>-<arch>`.
 Bun cross-compiles all five from one ubuntu runner (no native-runner matrix), so
 it is the cheapest of the binary workflows. The archive holds a self-contained
 executable — DuckDB `ATTACH`es it directly; the target host needs neither Bun nor
-`node_modules`. The Windows binary is `<bin>.exe` inside the `.tar.gz`.
+`node_modules`. The Windows binary is `<bin>.exe` inside the `.zip`/`.tar.gz`.
 
 ```yaml
   release:

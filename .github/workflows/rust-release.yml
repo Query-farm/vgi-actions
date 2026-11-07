@@ -9,9 +9,14 @@
 #
 # Standardized for binary-driven (Rust) workers:
 #   - one .tar.gz per DuckDB platform name (duckdb_platform(): linux_amd64,
-#     linux_arm64, osx_arm64, windows_amd64) — Windows ships .tar.gz
-#     too (NOT .zip), because the vgi client only consumes .tar.gz. Assets are
-#     named <asset_prefix>-<tag>-<duckdb_platform>.tar.gz.
+#     linux_arm64, osx_arm64, windows_amd64), named
+#     <asset_prefix>-<tag>-<duckdb_platform>.tar.gz, plus a .zip for windows_*
+#     and a <asset_prefix>-<tag>-<duckdb_platform>.sha256 sidecar — exactly the
+#     layout the vgi extension's `github-auto://owner/repo@tag` transport
+#     resolves (it fetches .zip on Windows, .tar.gz elsewhere, and runs the
+#     single exec-bit / .exe member), so no #path= fragment is needed.
+#   - Linux binaries are built with cargo-zigbuild against glibc 2.28, so they
+#     run on RHEL/Amazon Linux/Debian-era hosts, not just the runner's glibc.
 #   - macOS builds on a current Apple-Silicon runner (macos-15). No osx_amd64:
 #     DuckDB 2.0 / haybarn 2.0 dropped macOS on Intel, so nothing could load it.
 #     Every target builds native.
@@ -106,6 +111,9 @@ jobs:
       # Default the asset prefix to the repo name (input defaults can't use
       # contexts, so the fallback lives here).
       ASSET_PREFIX: ${{ inputs.asset_prefix || github.event.repository.name }}
+      BIN: ${{ inputs.bin }}
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
       # Harden cargo's crate downloads against transient CDN connection resets
       # (curl 56 / OpenSSL "unexpected eof" mid-download): retry more, and drop
       # HTTP/2 multiplexing — the known workaround for registry connection-reset
@@ -115,11 +123,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux legs build with cargo-zigbuild against a glibc 2.28 sysroot
+        # (`zig_target` = <triple>.2.28), so the binary runs on any glibc >= 2.28
+        # (RHEL/Alma/Rocky 8+, Amazon Linux 2023, Debian 10+, Ubuntu 18.10+)
+        # instead of only on the runner's own (ubuntu-latest = 26.04) glibc.
         include:
-          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  platform: linux_amd64 }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, platform: linux_arm64 }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  zig_target: x86_64-unknown-linux-gnu.2.28,  platform: linux_amd64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, zig_target: aarch64-unknown-linux-gnu.2.28, platform: linux_arm64 }
           - { os: macos-15,         target: aarch64-apple-darwin,      platform: osx_arm64 }
-          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    platform: windows_amd64 }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    platform: windows_amd64, ext: ".exe" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -133,53 +145,108 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Build the bin for the target, pack it into a .tar.gz on EVERY platform
-      # (`tar: all` + `zip: none` overrides the action's zip-on-Windows default),
-      # alongside the `include` files, emit a .sha256 sidecar, and upload to the
-      # Release. The archive is left in the workspace so the next step signs it.
-      - name: Build and upload binary
-        uses: taiki-e/upload-rust-binary-action@v1
+      # cargo-zigbuild + zig (pip wheels: `cargo-zigbuild` pulls `ziglang`).
+      # setup-python gives a pip that isn't PEP 668 "externally managed".
+      - uses: actions/setup-python@v5
+        if: matrix.zig_target != ''
         with:
-          bin: ${{ inputs.bin }}
-          target: ${{ matrix.target }}
-          # DuckDB platform name in the asset, not the Rust target triple, e.g.
-          # vgi-units-v0.1.0-linux_amd64.tar.gz. ($tag is taiki-e's tag token.)
-          archive: ${{ env.ASSET_PREFIX }}-$tag-${{ matrix.platform }}
-          tar: all
-          zip: none
-          include: ${{ inputs.include }}
-          checksum: sha256
-          locked: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          python-version: "3.13"
+      - name: Install cargo-zigbuild
+        if: matrix.zig_target != ''
+        run: python -m pip install cargo-zigbuild
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.zig_target }}" ]; then
+            cargo zigbuild --release --locked --bin "$BIN" --target "${{ matrix.zig_target }}"
+          else
+            cargo build --release --locked --bin "$BIN" --target "$TARGET"
+          fi
+          OUT="target/${TARGET}/release/${BIN}${{ matrix.ext }}"
+          test -s "$OUT"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+
+      # Fail the release if a Linux binary needs a glibc newer than 2.28.
+      - name: Check glibc symbol versions (Linux)
+        if: matrix.zig_target != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          max=$(objdump -T "$OUT" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "max GLIBC symbol version: ${max:-none}"
+          if [ -n "$max" ] && [ "$(printf '%s\n2.28\n' "$max" | sort -V | tail -1)" != "2.28" ]; then
+            echo "::error::$OUT requires GLIBC_$max (> 2.28)"; exit 1
+          fi
+
+      # Package in the layout the vgi extension's github-auto:// transport
+      # expects (see vgi docs/github-transport.md):
+      #   <prefix>-<tag>-<platform>.tar.gz — every platform; the worker is the ONLY
+      #     exec-bit member at the archive root (README/LICENSE forced to 0644),
+      #     so github-auto picks it with no #path= fragment.
+      #   <prefix>-<tag>-<platform>.zip    — windows_* only (github-auto fetches
+      #     .zip on Windows); <bin>.exe is the only .exe member.
+      #   <prefix>-<tag>-<platform>.sha256 — sha256sum lines for the archive(s).
+      #     github-auto reads the FIRST digest in it, so on Windows the .zip line
+      #     comes first; `sha256sum -c` still verifies every archive.
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          STEM="${ASSET_PREFIX}-${GITHUB_REF_NAME}-${PLATFORM}"
+          STAGE=".vgi-pkg-stage"   # workspace-relative: Windows-safe for msys tar + native 7z
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          NAME="$(basename "$OUT")"
+          cp "$OUT" "$STAGE/$NAME"; chmod 0755 "$STAGE/$NAME"
+          FILES=("$NAME")
+          IFS=',' read -ra INC <<< "${{ inputs.include }}"
+          for f in "${INC[@]}"; do
+            f="${f// /}"
+            if [ -n "$f" ] && [ -f "$f" ]; then
+              cp "$f" "$STAGE/$(basename "$f")"; chmod 0644 "$STAGE/$(basename "$f")"; FILES+=("$(basename "$f")")
+            fi
+          done
+          ARCHIVES=()
+          if [[ "$PLATFORM" == windows_* ]]; then
+            if command -v 7z >/dev/null; then (cd "$STAGE" && 7z a -tzip -bd "../${STEM}.zip" "${FILES[@]}" >/dev/null); else (cd "$STAGE" && zip -q -X "../${STEM}.zip" "${FILES[@]}"); fi
+            ARCHIVES+=("${STEM}.zip")
+          fi
+          COPYFILE_DISABLE=1 tar -C "$STAGE" -czf "${STEM}.tar.gz" "${FILES[@]}"
+          ARCHIVES+=("${STEM}.tar.gz")
+          if command -v sha256sum >/dev/null; then sha256sum "${ARCHIVES[@]}"; else shasum -a 256 "${ARCHIVES[@]}"; fi > "${STEM}.sha256"
+          cat "${STEM}.sha256"
+          tar -tvzf "${STEM}.tar.gz"
+          echo "archives=${ARCHIVES[*]}" >> "$GITHUB_OUTPUT"
+          { echo "subjects<<EOF"; printf '%s\n' "${ARCHIVES[@]}"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          echo "sidecar=${STEM}.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      # Keyless sigstore signature for the archive, mirroring docker-publish's
+      # Keyless sigstore signature for each archive, mirroring docker-publish's
       # `cosign sign`. Writes a self-contained .cosign.bundle (signature + cert +
-      # Rekor entry) and attaches it next to the archive on the Release.
-      - name: Sign archive with cosign (keyless) and attach bundle
+      # Rekor entry) per archive; everything is attached to the Release.
+      - name: Sign + upload archives, checksum, bundles
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          # This matrix leg produced exactly one archive in the workspace.
-          for f in "${ASSET_PREFIX}"-*.tar.gz; do
-            echo "::group::sign $f"
+          UPLOAD=("${{ steps.pkg.outputs.sidecar }}")
+          for f in ${{ steps.pkg.outputs.archives }}; do
             cosign sign-blob --yes --bundle "${f}.cosign.bundle" "$f"
-            gh release upload "${GITHUB_REF_NAME}" "${f}.cosign.bundle" --clobber
-            echo "::endgroup::"
+            UPLOAD+=("$f" "${f}.cosign.bundle")
           done
+          gh release upload "${GITHUB_REF_NAME}" "${UPLOAD[@]}" --clobber
 
-      # SLSA build-provenance attestation for the archive — keyless/sigstore,
+      # SLSA build-provenance attestation for the archive(s) — keyless/sigstore,
       # stored in GitHub's attestation API (verify with `gh attestation verify`).
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ${{ env.ASSET_PREFIX }}-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
+          subject-path: ${{ steps.pkg.outputs.subjects }}
 
   # Browser (wasm32) build — OPT-IN BY FILE PRESENCE: runs only when the repo has
   # a wasm/build.sh (the workers that build to DuckDB-WASM). Others no-op. Emits

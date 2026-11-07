@@ -11,8 +11,10 @@
 # prebuilt Bun runtime and embeds it + the bundled app into one executable). The
 # result is a self-contained binary that DuckDB ATTACHes directly — no Bun, no
 # node_modules on the target host. Assets are named
-# <asset_prefix>-<tag>-<duckdb_platform>.tar.gz (.tar.gz on every platform,
-# Windows included — the binary is <bin>.exe inside). Each archive is cosign
+# <asset_prefix>-<tag>-<duckdb_platform>.tar.gz on every platform, plus a .zip
+# for windows_* (the binary is <bin>.exe inside) — the layout the vgi extension's
+# `github-auto://owner/repo@tag` transport resolves with no #path= fragment.
+# (Bun's linux runtimes need only glibc 2.17.) Each archive is cosign
 # sign-blob'd into a .cosign.bundle and SLSA build-provenance attested.
 #
 # Signing runs HERE, so the keyless identity is this workflow
@@ -96,6 +98,7 @@ jobs:
     env:
       ASSET_PREFIX: ${{ inputs.asset_prefix || github.event.repository.name }}
       BIN: ${{ inputs.bin || github.event.repository.name }}
+      PLATFORM: ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
@@ -117,45 +120,85 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Compile, archive, checksum
+      - name: Compile
         shell: bash
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          EXT="${{ matrix.ext }}"
-          OUT="${BIN}${EXT}"
+          OUT="${BIN}${{ matrix.ext }}"
           EXTRA="${{ inputs.bun_build_args }}"
           EXTRA="${EXTRA//\$\{TAG\}/$TAG}"
 
           echo "::group::compile ${{ matrix.target }} -> ${OUT}"
           bun build "${{ inputs.entry }}" --compile --target="${{ matrix.target }}" $EXTRA --outfile "$OUT"
           echo "::endgroup::"
+          test -s "$OUT"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
 
-          FILES=("$OUT")
+      # Package in the layout the vgi extension's github-auto:// transport
+      # expects (see vgi docs/github-transport.md):
+      #   <prefix>-<tag>-<platform>.tar.gz — every platform; the worker is the ONLY
+      #     exec-bit member at the archive root (README/LICENSE forced to 0644),
+      #     so github-auto picks it with no #path= fragment.
+      #   <prefix>-<tag>-<platform>.zip    — windows_* only (github-auto fetches
+      #     .zip on Windows); <bin>.exe is the only .exe member.
+      #   <prefix>-<tag>-<platform>.sha256 — sha256sum lines for the archive(s).
+      #     github-auto reads the FIRST digest in it, so on Windows the .zip line
+      #     comes first; `sha256sum -c` still verifies every archive.
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          STEM="${ASSET_PREFIX}-${GITHUB_REF_NAME}-${PLATFORM}"
+          STAGE=".vgi-pkg-stage"   # workspace-relative: Windows-safe for msys tar + native 7z
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          NAME="$(basename "$OUT")"
+          cp "$OUT" "$STAGE/$NAME"; chmod 0755 "$STAGE/$NAME"
+          FILES=("$NAME")
           IFS=',' read -ra INC <<< "${{ inputs.include }}"
-          for f in "${INC[@]}"; do f="${f// /}"; [ -n "$f" ] && [ -f "$f" ] && FILES+=("$f"); done
-
-          ARCHIVE="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.tar.gz"
-          SUM="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.sha256"
-          tar czf "$ARCHIVE" "${FILES[@]}"
-          sha256sum "$ARCHIVE" > "$SUM"
+          for f in "${INC[@]}"; do
+            f="${f// /}"
+            if [ -n "$f" ] && [ -f "$f" ]; then
+              cp "$f" "$STAGE/$(basename "$f")"; chmod 0644 "$STAGE/$(basename "$f")"; FILES+=("$(basename "$f")")
+            fi
+          done
+          ARCHIVES=()
+          if [[ "$PLATFORM" == windows_* ]]; then
+            if command -v 7z >/dev/null; then (cd "$STAGE" && 7z a -tzip -bd "../${STEM}.zip" "${FILES[@]}" >/dev/null); else (cd "$STAGE" && zip -q -X "../${STEM}.zip" "${FILES[@]}"); fi
+            ARCHIVES+=("${STEM}.zip")
+          fi
+          COPYFILE_DISABLE=1 tar -C "$STAGE" -czf "${STEM}.tar.gz" "${FILES[@]}"
+          ARCHIVES+=("${STEM}.tar.gz")
+          if command -v sha256sum >/dev/null; then sha256sum "${ARCHIVES[@]}"; else shasum -a 256 "${ARCHIVES[@]}"; fi > "${STEM}.sha256"
+          cat "${STEM}.sha256"
+          tar -tvzf "${STEM}.tar.gz"
+          echo "archives=${ARCHIVES[*]}" >> "$GITHUB_OUTPUT"
+          { echo "subjects<<EOF"; printf '%s\n' "${ARCHIVES[@]}"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          echo "sidecar=${STEM}.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign + upload archive, checksum, bundle
+      # Keyless sigstore signature for each archive, mirroring docker-publish's
+      # `cosign sign`. Writes a self-contained .cosign.bundle (signature + cert +
+      # Rekor entry) per archive; everything is attached to the Release.
+      - name: Sign + upload archives, checksum, bundles
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          ARCHIVE="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.tar.gz"
-          SUM="${ASSET_PREFIX}-${TAG}-${{ matrix.platform }}.sha256"
-          cosign sign-blob --yes --bundle "${ARCHIVE}.cosign.bundle" "$ARCHIVE"
-          gh release upload "$TAG" "$ARCHIVE" "$SUM" "${ARCHIVE}.cosign.bundle" --clobber
+          UPLOAD=("${{ steps.pkg.outputs.sidecar }}")
+          for f in ${{ steps.pkg.outputs.archives }}; do
+            cosign sign-blob --yes --bundle "${f}.cosign.bundle" "$f"
+            UPLOAD+=("$f" "${f}.cosign.bundle")
+          done
+          gh release upload "${GITHUB_REF_NAME}" "${UPLOAD[@]}" --clobber
 
+      # SLSA build-provenance attestation for the archive(s) — keyless/sigstore,
+      # stored in GitHub's attestation API (verify with `gh attestation verify`).
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ${{ env.ASSET_PREFIX }}-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
+          subject-path: ${{ steps.pkg.outputs.subjects }}
